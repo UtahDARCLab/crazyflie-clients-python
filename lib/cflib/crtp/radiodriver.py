@@ -138,7 +138,7 @@ class RadioDriver(CRTPDriver):
         if uri_data.group(9):
             addr = "{:X}".format(int(uri_data.group(9)))
             new_addr = struct.unpack("<BBBBB", binascii.unhexlify(addr))
-            self.cradio.set_address(new_addr)
+        self._profile.pid = pid
 
         # Prepare the inter-thread communication queue
         self.in_queue = Queue.Queue()
