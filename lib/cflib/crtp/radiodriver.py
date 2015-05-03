@@ -259,30 +259,30 @@ class RadioDriver(CRTPDriver):
         if address != None:
             addr = "{:X}".format(address)
             new_addr = struct.unpack("<BBBBB", binascii.unhexlify(addr))
-            self.cradio.set_address(new_addr)
+            cradio.set_address(new_addr)
 
-        self.cradio.set_arc(1)
+        cradio.set_arc(1)
 
-        self.cradio.set_data_rate(self.cradio.DR_250KPS)
+        cradio.set_data_rate(cradio.DR_250KPS)
 
         if address == None or address == 0xE7E7E7E7E7:
             found += map(lambda c: ["radio://0/{}/250K".format(c), ""],
-                         self._scan_radio_channels())
-            self.cradio.set_data_rate(self.cradio.DR_1MPS)
+                         self._scan_radio_channels(cradio))
+            cradio.set_data_rate(cradio.DR_1MPS)
             found += map(lambda c: ["radio://0/{}/1M".format(c), ""],
-                         self._scan_radio_channels())
-            self.cradio.set_data_rate(self.cradio.DR_2MPS)
+                         self._scan_radio_channels(cradio))
+            cradio.set_data_rate(cradio.DR_2MPS)
             found += map(lambda c: ["radio://0/{}/2M".format(c), ""],
-                         self._scan_radio_channels())
+                         self._scan_radio_channels(cradio))
         else:
             found += map(lambda c: ["radio://0/{}/250K/{:X}".format(c, address), ""],
-                         self._scan_radio_channels())
-            self.cradio.set_data_rate(self.cradio.DR_1MPS)
+                         self._scan_radio_channels(cradio))
+            cradio.set_data_rate(cradio.DR_1MPS)
             found += map(lambda c: ["radio://0/{}/1M/{:X}".format(c, address), ""],
-                         self._scan_radio_channels())
-            self.cradio.set_data_rate(self.cradio.DR_2MPS)
+                         self._scan_radio_channels(cradio))
+            cradio.set_data_rate(cradio.DR_2MPS)
             found += map(lambda c: ["radio://0/{}/2M/{:X}".format(c, address), ""],
-                         self._scan_radio_channels())
+                         self._scan_radio_channels(cradio))
 
         cradio.close()
         cradio = None
