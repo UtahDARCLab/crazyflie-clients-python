@@ -49,7 +49,7 @@ from cflib.crazyflie import Crazyflie
 from dialogs.logconfigdialogue import LogConfigDialogue
 
 from cfclient.utils.input import JoystickReader
-from cfclient.utils.guiconfig import GuiConfig
+from cfclient.utils.config import Config
 from cfclient.utils.logconfigreader import LogConfigReader
 from cfclient.utils.config_manager import ConfigManager
 
@@ -138,7 +138,7 @@ class MainUI(QtGui.QMainWindow, main_window_class):
         self.cf = Crazyflie(ro_cache=sys.path[0] + "/cflib/cache",
                             rw_cache=sys.path[1] + "/cache")
 
-        cflib.crtp.init_drivers(enable_debug_driver=GuiConfig()
+        cflib.crtp.init_drivers(enable_debug_driver=Config()
                                                 .get("enable_debug_driver"))
 
         # Create the connection dialogue
@@ -152,17 +152,16 @@ class MainUI(QtGui.QMainWindow, main_window_class):
         self._active_device = ""
         self.configGroup = QActionGroup(self._menu_mappings, exclusive=True)
         self._load_input_data()
-        self._update_input
         ConfigManager().conf_needs_reload.add_callback(self._reload_configs)
 
         # Connections for the Connect Dialogue
         self.connectDialogue.requestConnectionSignal.connect(self.cf.open_link)
 
         self.cf.connection_failed.add_callback(self.connectionFailedSignal.emit)
-        self.connectionFailedSignal.connect(self.connectionFailed)
+        self.connectionFailedSignal.connect(self._connection_failed)
         
         
-        self._input_device_error_signal.connect(self.inputDeviceError)
+        self._input_device_error_signal.connect(self._display_input_device_error)
         self.joystickReader.device_error.add_callback(
                         self._input_device_error_signal.emit)
         self._input_discovery_signal.connect(self.device_discovery)
@@ -170,43 +169,38 @@ class MainUI(QtGui.QMainWindow, main_window_class):
                         self._input_discovery_signal.emit)
 
         # Connect UI signals
-        self.menuItemConnect.triggered.connect(self.connectButtonClicked)
-        self.logConfigAction.triggered.connect(self.doLogConfigDialogue)
-        self.connectButton.clicked.connect(self.connectButtonClicked)
-        self.quickConnectButton.clicked.connect(self.quickConnect)
-        self.menuItemQuickConnect.triggered.connect(self.quickConnect)
-        self.menuItemConfInputDevice.triggered.connect(self.configInputDevice)
+        self.menuItemConnect.triggered.connect(self._connect)
+        self.logConfigAction.triggered.connect(self._show_connect_dialog)
+        self.connectButton.clicked.connect(self._connect)
+        self.quickConnectButton.clicked.connect(self._quick_connect)
+        self.menuItemQuickConnect.triggered.connect(self._quick_connect)
+        self.menuItemConfInputDevice.triggered.connect(self._show_input_device_config_dialog)
         self.menuItemExit.triggered.connect(self.closeAppRequest)
-        self.batteryUpdatedSignal.connect(self.updateBatteryVoltage)
+        self.batteryUpdatedSignal.connect(self._update_vbatt)
         self._menuitem_rescandevices.triggered.connect(self._rescan_devices)
         self._menuItem_openconfigfolder.triggered.connect(self._open_config_folder)
 
-        self._auto_reconnect_enabled = GuiConfig().get("auto_reconnect")
+        self._auto_reconnect_enabled = Config().get("auto_reconnect")
         self.autoReconnectCheckBox.toggled.connect(
                                               self._auto_reconnect_changed)
-        self.autoReconnectCheckBox.setChecked(GuiConfig().get("auto_reconnect"))
+        self.autoReconnectCheckBox.setChecked(Config().get("auto_reconnect"))
         
-        # Do not queue data from the controller output to the Crazyflie wrapper
-        # to avoid latency
-        #self.joystickReader.sendControlSetpointSignal.connect(
-        #                                      self.cf.commander.send_setpoint,
-        #                                      Qt.DirectConnection)
         self.joystickReader.input_updated.add_callback(
                                          self.cf.commander.send_setpoint)
 
         # Connection callbacks and signal wrappers for UI protection
         self.cf.connected.add_callback(self.connectionDoneSignal.emit)
-        self.connectionDoneSignal.connect(self.connectionDone)
+        self.connectionDoneSignal.connect(self._connected)
         self.cf.disconnected.add_callback(self.disconnectedSignal.emit)
         self.disconnectedSignal.connect(
-                        lambda linkURI: self.setUIState(UIState.DISCONNECTED,
+                        lambda linkURI: self._update_ui_state(UIState.DISCONNECTED,
                                                         linkURI))
         self.cf.connection_lost.add_callback(self.connectionLostSignal.emit)
-        self.connectionLostSignal.connect(self.connectionLost)
+        self.connectionLostSignal.connect(self._connection_lost)
         self.cf.connection_requested.add_callback(
                                          self.connectionInitiatedSignal.emit)
         self.connectionInitiatedSignal.connect(
-                           lambda linkURI: self.setUIState(UIState.CONNECTING,
+                           lambda linkURI: self._update_ui_state(UIState.CONNECTING,
                                                            linkURI))
         self._log_error_signal.connect(self._logging_error)
 
@@ -216,10 +210,16 @@ class MainUI(QtGui.QMainWindow, main_window_class):
                    lambda percentage: self.linkQualityBar.setValue(percentage))
 
         # Set UI state in disconnected buy default
-        self.setUIState(UIState.DISCONNECTED)
+        self._update_ui_state(UIState.DISCONNECTED)
 
         # Parse the log configuration files
         self.logConfigReader = LogConfigReader(self.cf)
+
+        self._current_input_config = None
+        self._active_config = None
+        self._active_config = None
+
+        self.inputConfig = None
 
         # Add things to helper so tabs can access it
         cfclient.ui.pluginhelper.cf = self.cf
@@ -276,17 +276,38 @@ class MainUI(QtGui.QMainWindow, main_window_class):
 
         # First instantiate all tabs and then open them in the correct order
         try:
-            for tName in GuiConfig().get("open_tabs").split(","):
+            for tName in Config().get("open_tabs").split(","):
                 t = tabItems[tName]
                 if (t != None and t.isEnabled()):
                     # Toggle though menu so it's also marked as open there
                     t.toggle()
         except Exception as e:
-            logger.warning("Exception while opening tabs [%s]", e)
+            logger.warning("Exception while opening tabs [{}]".format(e))
 
-    def setUIState(self, newState, linkURI=""):
+        # Check which Input muxes are available
+        self._mux_group = QActionGroup(self._menu_mux, exclusive=True)
+        for m in self.joystickReader.available_mux():
+            node = QAction(m,
+                           self._menu_mux,
+                           checkable=True,
+                           enabled=True)
+            node.toggled.connect(self._mux_selected)
+            self._mux_group.addAction(node)
+            self._menu_mux.addAction(node)
+        # TODO: Temporary
+        self._input_dev_stack = []
+        self._menu_mux.actions()[0].setChecked(True)
+
+        if Config().get("enable_input_muxing"):
+            self._menu_mux.setEnabled(True)
+        else:
+            logger.info("Input device muxing disabled in config")
+
+        self._mapping_support = True
+
+    def _update_ui_state(self, newState, linkURI=""):
         self.uiState = newState
-        if (newState == UIState.DISCONNECTED):
+        if newState == UIState.DISCONNECTED:
             self.setWindowTitle("Not connected")
             self.menuItemConnect.setText("Connect to Crazyflie")
             self.connectButton.setText("Connect")
@@ -297,9 +318,9 @@ class MainUI(QtGui.QMainWindow, main_window_class):
             self.linkQualityBar.setValue(0)
             self.menuItemBootloader.setEnabled(True)
             self.logConfigAction.setEnabled(False)
-            if (len(GuiConfig().get("link_uri")) > 0):
+            if len(Config().get("link_uri")) > 0:
                 self.quickConnectButton.setEnabled(True)
-        if (newState == UIState.CONNECTED):
+        if newState == UIState.CONNECTED:
             s = "Connected on %s" % linkURI
             self.setWindowTitle(s)
             self.menuItemConnect.setText("Disconnect")
@@ -310,8 +331,8 @@ class MainUI(QtGui.QMainWindow, main_window_class):
             if len(self.cf.mem.get_mems(MemoryElement.TYPE_I2C)) > 0:
                 self._menu_cf2_config.setEnabled(True)
             self._menu_cf1_config.setEnabled(False)
-        if (newState == UIState.CONNECTING):
-            s = "Connecting to %s ..." % linkURI
+        if newState == UIState.CONNECTING:
+            s = "Connecting to {} ...".format(linkURI)
             self.setWindowTitle(s)
             self.menuItemConnect.setText("Cancel")
             self.connectButton.setText("Cancel")
@@ -342,78 +363,78 @@ class MainUI(QtGui.QMainWindow, main_window_class):
         self.joystickReader.stop_input()
         for c in self._menu_mappings.actions():
             c.setEnabled(False)
-        devs = self.joystickReader.getAvailableDevices()
+        devs = self.joystickReader.available_devices()
         if (len(devs) > 0):
             self.device_discovery(devs)
 
-    def configInputDevice(self):
+    def _show_input_device_config_dialog(self):
         self.inputConfig = InputConfigDialogue(self.joystickReader)
         self.inputConfig.show()
         
     def _auto_reconnect_changed(self, checked):
         self._auto_reconnect_enabled = checked 
-        GuiConfig().set("auto_reconnect", checked)
-        logger.info("Auto reconnect enabled: %s", checked)     
+        Config().set("auto_reconnect", checked)
+        logger.info("Auto reconnect enabled: {}".format(checked))
 
-    def doLogConfigDialogue(self):
+    def _show_connect_dialog(self):
         self.logConfigDialogue.show()
 
-    def updateBatteryVoltage(self, timestamp, data, logconf):
+    def _update_vbatt(self, timestamp, data, logconf):
         self.batteryBar.setValue(int(data["pm.vbat"] * 1000))
 
-    def connectionDone(self, linkURI):
-        self.setUIState(UIState.CONNECTED, linkURI)
+    def _connected(self, linkURI):
+        self._update_ui_state(UIState.CONNECTED, linkURI)
 
-        GuiConfig().set("link_uri", linkURI)
+        Config().set("link_uri", str(linkURI))
 
         lg = LogConfig("Battery", 1000)
         lg.add_variable("pm.vbat", "float")
-        self.cf.log.add_config(lg)
-        if lg.valid:
+        try:
+            self.cf.log.add_config(lg)
             lg.data_received_cb.add_callback(self.batteryUpdatedSignal.emit)
             lg.error_cb.add_callback(self._log_error_signal.emit)
             lg.start()
-        else:
-            logger.warning("Could not setup loggingblock!")
+        except KeyError as e:
+            logger.warning(str(e))
 
     def _logging_error(self, log_conf, msg):
         QMessageBox.about(self, "Log error", "Error when starting log config"
-                " [%s]: %s" % (log_conf.name, msg))
+                " [{}]: {}".format(log_conf.name, msg))
 
-    def connectionLost(self, linkURI, msg):
+    def _connection_lost(self, linkURI, msg):
         if not self._auto_reconnect_enabled:
-            if (self.isActiveWindow()):
+            if self.isActiveWindow():
                 warningCaption = "Communication failure"
-                error = "Connection lost to %s: %s" % (linkURI, msg)
+                error = "Connection lost to {}: {}".format(linkURI, msg)
                 QMessageBox.critical(self, warningCaption, error)
-                self.setUIState(UIState.DISCONNECTED, linkURI)
+                self._update_ui_state(UIState.DISCONNECTED, linkURI)
         else:
-            self.quickConnect()
+            self._quick_connect()
 
-    def connectionFailed(self, linkURI, error):
+    def _connection_failed(self, linkURI, error):
         if not self._auto_reconnect_enabled:
-            msg = "Failed to connect on %s: %s" % (linkURI, error)
+            msg = "Failed to connect on {}: {}".format(linkURI, error)
             warningCaption = "Communication failure"
             QMessageBox.critical(self, warningCaption, msg)
-            self.setUIState(UIState.DISCONNECTED, linkURI)
+            self._update_ui_state(UIState.DISCONNECTED, linkURI)
         else:
-            self.quickConnect()
+            self._quick_connect()
 
     def closeEvent(self, event):
         self.hide()
         self.cf.close_link()
-        GuiConfig().save_file()
+        Config().save_file()
 
-    def connectButtonClicked(self):
-        if (self.uiState == UIState.CONNECTED):
+    def _connect(self):
+        if self.uiState == UIState.CONNECTED:
             self.cf.close_link()
-        elif (self.uiState == UIState.CONNECTING):
+        elif self.uiState == UIState.CONNECTING:
             self.cf.close_link()
-            self.setUIState(UIState.DISCONNECTED)
+            self._update_ui_state(UIState.DISCONNECTED)
         else:
             self.connectDialogue.show()
 
-    def inputDeviceError(self, error):
+    def _display_input_device_error(self, error):
         self.cf.close_link()
         QMessageBox.critical(self, "Input device error", error)
 
@@ -441,16 +462,10 @@ class MainUI(QtGui.QMainWindow, main_window_class):
         self._update_input(self._active_device, newConfigName)
 
     def _update_input(self, device="", config=""):
-        self.joystickReader.stop_input()
         self._active_config = str(config)
         self._active_device = str(device)
 
-        GuiConfig().set("input_device", self._active_device)
-        GuiConfig().get(
-                     "device_config_mapping"
-                     )[self._active_device] = self._active_config
-        self.joystickReader.start_input(self._active_device,
-                                       self._active_config)
+        Config().set("input_device", str(self._active_device))
 
         # update the checked state of the menu items
         for c in self._menu_mappings.actions():
@@ -461,90 +476,143 @@ class MainUI(QtGui.QMainWindow, main_window_class):
             c.setEnabled(True)
             if c.text() == self._active_device:
                 c.setChecked(True)
-
         # update label
         if device == "" and config == "":
             self._statusbar_label.setText("No input device selected")
         elif config == "":
-            self._statusbar_label.setText("Using [%s] - "
-                                          "No input config selected" %
+            self._statusbar_label.setText("Using [{}] - "
+                                          "No input config selected".format
                                           (self._active_device))
         else:
-            self._statusbar_label.setText("Using [%s] with config [%s]" %
+            self._statusbar_label.setText("Using [{}] with config [{}]".format
                                           (self._active_device,
                                            self._active_config))
 
-    def _inputdevice_selected(self, checked):
-        if (not checked):
+    def _mux_selected(self, checked):
+        if not checked:
             return
-        self.joystickReader.stop_input()
-        sender = self.sender()
-        self._active_device = sender.text()
-        device_config_mapping = GuiConfig().get("device_config_mapping")
-        if (self._active_device in device_config_mapping.keys()):
-            self._current_input_config = device_config_mapping[
-                str(self._active_device)]
+
+        selected_mux_name = str(self.sender().text())
+        self.joystickReader.set_mux(name=selected_mux_name)
+
+        logger.debug("Selected mux supports {} devices".format(self.joystickReader.get_mux_supported_dev_count()))
+        self._adjust_nbr_of_selected_devices()
+
+    def _get_saved_device_mapping(self, device_name):
+        """Return the saved mapping for a given device"""
+        config = None
+        device_config_mapping = Config().get("device_config_mapping")
+        if device_name in device_config_mapping.keys():
+            config = device_config_mapping[device_name]
+
+        logging.debug("For [{}] we recommend [{}]".format(device_name, config))
+        return config
+
+
+    def _update_input_device_footer(self, device_name=None, mapping_name=None):
+        """Update the footer in the bottom of the UI with status for the
+        input device and its mapping"""
+        if not device_name and not mapping_name:
+            self._statusbar_label.setText("No input device selected")
+        elif self._mapping_support and not mapping_name:
+            self._statusbar_label.setText("Using [{}] - "
+                                          "No input config selected".format(
+                                            device_name))
+        elif not self._mapping_support:
+            self._statusbar_label.setText("Using [{}]".format(device_name))
         else:
-            self._current_input_config = self._menu_mappings.actions()[0].text()
-        GuiConfig().set("input_device", str(self._active_device))
+            self._statusbar_label.setText("Using [{}] with config [{}]".format(
+                                            device_name, mapping_name))
 
-        for c in self._menu_mappings.actions():
-            if (c.text() == self._current_input_config):
-                c.setChecked(True)
+    def _adjust_nbr_of_selected_devices(self):
+        nbr_of_selected = len(self._input_dev_stack)
+        nbr_of_supported = self.joystickReader.get_mux_supported_dev_count()
+        while len(self._input_dev_stack) > nbr_of_supported:
+            to_close = self._input_dev_stack.pop(0)
+            # Close and de-select it in the UI
+            self.joystickReader.stop_input(to_close)
+            for c in self._menu_devices.actions():
+                if c.text() == to_close:
+                        c.setChecked(False)
 
-        self.joystickReader.start_input(str(sender.text()),
-                                        self._current_input_config)
-        self._statusbar_label.setText("Using [%s] with config [%s]" % (
-                                      self._active_device,
-                                      self._current_input_config))
+    def _inputdevice_selected(self, checked):
+        """Called when a new input device has been selected from the menu"""
+        if not checked:
+            return
+
+        self._input_dev_stack.append(self.sender().text())
+
+        selected_device_name = str(self.sender().text())
+        self._active_device = selected_device_name
+
+        # Save the device as "last used device"
+        Config().set("input_device", str(selected_device_name))
+
+        # Read preferred config used for this controller from config,
+        # if found then select this config in the menu
+
+        self._mapping_support = self.joystickReader.start_input(selected_device_name)
+        self._adjust_nbr_of_selected_devices()
+
+        if self.joystickReader.get_mux_supported_dev_count() == 1:
+            preferred_config = self.joystickReader.get_saved_device_mapping(selected_device_name)
+            if preferred_config:
+                for c in self._menu_mappings.actions():
+                    if c.text() == preferred_config:
+                        c.setChecked(True)
 
     def _inputconfig_selected(self, checked):
-        if (not checked):
+        """Called when a new configuration has been selected from the menu"""
+        if not checked:
             return
-        self._update_input(self._active_device, self.sender().text())
+        selected_mapping = str(self.sender().text())
+        self.joystickReader.set_input_map(self._active_device, selected_mapping)
+        self._update_input_device_footer(self._active_device, selected_mapping)
 
     def device_discovery(self, devs):
-        group = QActionGroup(self._menu_devices, exclusive=True)
+        group = QActionGroup(self._menu_devices, exclusive=False)
 
         for d in devs:
-            node = QAction(d["name"], self._menu_devices, checkable=True)
+            node = QAction(d.name, self._menu_devices, checkable=True)
             node.toggled.connect(self._inputdevice_selected)
             group.addAction(node)
             self._menu_devices.addAction(node)
-            if (d["name"] == GuiConfig().get("input_device")):
-                self._active_device = d["name"]
-        if (len(self._active_device) == 0):
-            self._active_device = self._menu_devices.actions()[0].text()
+            if d.name == Config().get("input_device"):
+                self._active_device = d.name
+        if len(self._active_device) == 0:
+            self._active_device = str(self._menu_devices.actions()[0].text())
 
-        device_config_mapping = GuiConfig().get("device_config_mapping")
-        if (device_config_mapping):
-            if (self._active_device in device_config_mapping.keys()):
+        device_config_mapping = Config().get("device_config_mapping")
+        if device_config_mapping:
+            if self._active_device in device_config_mapping.keys():
                 self._current_input_config = device_config_mapping[
-                    str(self._active_device)]
+                    self._active_device]
             else:
-                self._current_input_config = self._menu_mappings.actions()[0].text()
+                self._current_input_config = self._menu_mappings.actions()[0]\
+                    .text()
         else:
             self._current_input_config = self._menu_mappings.actions()[0].text()
 
         # Now we know what device to use and what mapping, trigger the events
         # to change the menus and start the input
+        for c in self._menu_devices.actions():
+            if c.text() == self._active_device:
+                c.setChecked(True)
+
         for c in self._menu_mappings.actions():
             c.setEnabled(True)
-            if (c.text() == self._current_input_config):
+            if c.text() == self._current_input_config:
                 c.setChecked(True)
 
-        for c in self._menu_devices.actions():
-            if (c.text() == self._active_device):
-                c.setChecked(True)
-
-    def quickConnect(self):
+    def _quick_connect(self):
         try:
-            self.cf.open_link(GuiConfig().get("link_uri"))
+            self.cf.open_link(Config().get("link_uri"))
         except KeyError:
             self.cf.open_link("")
 
     def _open_config_folder(self):
-        QDesktopServices.openUrl(QUrl("file:///" + QDir.toNativeSeparators(sys.path[1])))
+        QDesktopServices.openUrl(QUrl("file:///" +
+                                      QDir.toNativeSeparators(sys.path[1])))
 
     def closeAppRequest(self):
         self.close()

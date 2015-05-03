@@ -50,6 +50,9 @@ import traceback
 import logging
 import shutil
 
+import cfclient.utils.inputreaders as readers
+import cfclient.utils.inputinterfaces as interfaces
+
 logger = logging.getLogger(__name__)
 
 from cfclient.utils.config import Config
@@ -57,6 +60,13 @@ from cfclient.utils.config_manager import ConfigManager
 
 from cfclient.utils.periodictimer import PeriodicTimer
 from cflib.utils.callbacks import Caller
+import cfclient.utils.mux
+from cfclient.utils.mux import InputMux
+from cfclient.utils.mux.nomux import NoMux
+from cfclient.utils.mux.selectivemux import SelectiveMux
+from cfclient.utils.mux.takeovermux import TakeOverMux
+from cfclient.utils.mux.mixmux import MixMux
+from cfclient.utils.mux.takeoverselectivemux import TakeOverSelectiveMux
 
 MAX_THRUST = 65000
 
@@ -68,19 +78,13 @@ class JoystickReader:
     inputConfig = []
 
     def __init__(self, do_device_discovery=True):
-        if sys.platform.startswith('linux'):
-            from cfclient.utils.joystick.linuxjsdev import Joystick
-            self.inputdevice = Joystick()
-        else:
-            from cfclient.utils.pysdl2reader import PySDL2Reader
-            self.inputdevice = PySDL2Reader()
-        
+        self._input_device = None
+
         self._min_thrust = 0
         self._max_thrust = 0
         self._thrust_slew_rate = 0
         self._thrust_slew_enabled = False
         self._thrust_slew_limit = 0
-        self._emergency_stop = False
         self._has_pressure_sensor = False
 
         self._old_thrust = 0
@@ -88,12 +92,21 @@ class JoystickReader:
         self._old_alt_hold = False
         self._springy_throttle = True
 
+        self._prev_values = {}
+
         self._trim_roll = Config().get("trim_roll")
         self._trim_pitch = Config().get("trim_pitch")
 
-        if (Config().get("flightmode") is "Normal"):
-            self._max_yaw_rate = Config().get("normal_max_yaw")
-            self._max_rp_angle = Config().get("normal_max_rp")
+        self._input_map = None
+
+        self._mux = [NoMux(self), SelectiveMux(self), TakeOverMux(self),
+                     MixMux(self), TakeOverSelectiveMux(self)]
+        # Set NoMux as default
+        self._selected_mux = self._mux[0]
+
+        if Config().get("flightmode") is "Normal":
+            self.set_yaw_limit(Config().get("normal_max_yaw"))
+            self.set_rp_limit(Config().get("normal_max_rp"))
             # Values are stored at %, so use the functions to set the values
             self.set_thrust_limits(
                 Config().get("normal_min_thrust"),
@@ -102,8 +115,8 @@ class JoystickReader:
                 Config().get("normal_slew_rate"),
                 Config().get("normal_slew_limit"))
         else:
-            self._max_yaw_rate = Config().get("max_yaw")
-            self._max_rp_angle = Config().get("max_rp")
+            self.set_yaw_limit(Config().get("max_yaw"))
+            self.set_rp_limit(Config().get("max_rp"))
             # Values are stored at %, so use the functions to set the values
             self.set_thrust_limits(
                 Config().get("min_thrust"), Config().get("max_thrust"))
@@ -111,7 +124,7 @@ class JoystickReader:
                 Config().get("slew_rate"), Config().get("slew_limit"))
 
         self._dev_blacklist = None
-        if (len(Config().get("input_device_blacklist")) > 0):
+        if len(Config().get("input_device_blacklist")) > 0:
             self._dev_blacklist = re.compile(
                             Config().get("input_device_blacklist"))
         logger.info("Using device blacklist [{}]".format(
@@ -149,192 +162,257 @@ class JoystickReader:
         self.device_discovery = Caller()
         self.device_error = Caller()
         self.althold_updated = Caller()
+        self.alt1_updated = Caller()
+        self.alt2_updated = Caller()
 
-    def setAltHoldAvailable(self, available):
+        # Call with 3 bools (rp_limiting, yaw_limiting, thrust_limiting)
+        self.limiting_updated = Caller()
+
+    def set_alt_hold_available(self, available):
+        """Set if altitude hold is available or not (depending on HW)"""
         self._has_pressure_sensor = available
 
-    def setAltHold(self, althold):
+    def enable_alt_hold(self, althold):
+        """Enable or disable altitude hold"""
         self._old_alt_hold = althold
 
     def _do_device_discovery(self):
-        devs = self.getAvailableDevices()
+        devs = self.available_devices()
 
         if len(devs):
             self.device_discovery.call(devs)
             self._discovery_timer.stop()
 
-    def getAvailableDevices(self):
+    def available_mux(self):
+        available = []
+        for m in self._mux:
+            available.append(m.name)
+
+        return available
+
+    def set_mux(self, name=None, mux=None):
+        if name:
+            for m in self._mux:
+                if m.name == name:
+                    self._selected_mux = m
+        elif mux:
+            self._selected_mux = mux
+
+        logger.info("Selected MUX: {}".format(self._selected_mux.name))
+
+    def get_mux_supported_dev_count(self):
+        return self._selected_mux.get_supported_dev_count()
+
+    def available_devices(self):
         """List all available and approved input devices.
         This function will filter available devices by using the
         blacklist configuration and only return approved devices."""
-        devs = self.inputdevice.getAvailableDevices()
+        devs = readers.devices()
+        devs += interfaces.devices()
         approved_devs = []
 
         for dev in devs:
             if ((not self._dev_blacklist) or 
                     (self._dev_blacklist and not
-                     self._dev_blacklist.match(dev["name"]))):
-                self._available_devices[dev["name"]] = dev["id"]
+                     self._dev_blacklist.match(dev.name))):
                 approved_devs.append(dev)
 
         return approved_devs 
 
-    def enableRawReading(self, deviceId):
+    def enableRawReading(self, device_name):
         """
         Enable raw reading of the input device with id deviceId. This is used
         to get raw values for setting up of input devices. Values are read
         without using a mapping.
         """
-        self.inputdevice.enableRawReading(deviceId)
+        if self._input_device:
+            self._input_device.close()
+            self._input_device = None
 
-    def disableRawReading(self):
+        for d in readers.devices():
+            if d.name == device_name:
+                self._input_device = d
+
+        # Set the mapping to None to get raw values
+        self._input_device.input_map = None
+        self._input_device.open()
+
+    def get_saved_device_mapping(self, device_name):
+        """Return the saved mapping for a given device"""
+        config = None
+        device_config_mapping = Config().get("device_config_mapping")
+        if device_name in device_config_mapping.keys():
+            config = device_config_mapping[device_name]
+
+        logging.debug("For [{}] we recommend [{}]".format(device_name, config))
+        return config
+
+    def stop_raw_reading(self):
         """Disable raw reading of input device."""
-        self.inputdevice.disableRawReading()
+        if self._input_device:
+            self._input_device.close()
+            self._input_device = None
 
-    def readRawValues(self):
+    def read_raw_values(self):
         """ Read raw values from the input device."""
-        return self.inputdevice.readRawValues()
+        [axes, buttons, mapped_values] = self._input_device.read(include_raw=True)
+        dict_axes = {}
+        dict_buttons = {}
 
-    def start_input(self, device_name, config_name):
+        for i, a in enumerate(axes):
+            dict_axes[i] = a
+
+        for i, b in enumerate(buttons):
+            dict_buttons[i] = b
+
+        return [dict_axes, dict_buttons, mapped_values]
+
+    def set_raw_input_map(self, input_map):
+        """Set an input device map"""
+        if self._input_device:
+            self._input_device.input_map = input_map
+
+    def set_input_map(self, device_name, input_map_name):
+        """Load and set an input device map with the given name"""
+        settings = ConfigManager().get_settings(input_map_name)
+        if settings:
+            self._springy_throttle = settings["springythrottle"]
+            self._input_map = ConfigManager().get_config(input_map_name)
+        if self._input_device:
+            self._input_device.input_map = self._input_map
+        Config().get("device_config_mapping")[device_name] = input_map_name
+
+    def get_device_name(self):
+        """Get the name of the current open device"""
+        if self._input_device:
+            return self._input_device.name
+        return None
+
+    def start_input(self, device_name, config_name=None):
         """
         Start reading input from the device with name device_name using config
-        config_name
+        config_name. Returns True if device supports mapping, otherwise False
         """
         try:
-            device_id = self._available_devices[device_name]
-            self.inputdevice.start_input(
-                                    device_id,
-                                    ConfigManager().get_config(config_name))
-            settings = ConfigManager().get_settings(config_name)
-            self._springy_throttle = settings["springythrottle"]
-            self._read_timer.start()
+            #device_id = self._available_devices[device_name]
+            # Check if we supplied a new map, if not use the preferred one
+            for d in readers.devices():
+                if d.name == device_name:
+                    self._input_device = d
+                    if not config_name:
+                        config_name = self.get_saved_device_mapping(device_name)
+                    self.set_input_map(device_name, config_name)
+                    self._input_device.open()
+                    self._input_device.input_map = self._input_map
+                    self._input_device.input_map_name = config_name
+                    self._selected_mux.add_device(self._input_device, None)
+                    # Update the UI with the limiting for this device
+                    self.limiting_updated.call(self._input_device.limit_rp,
+                                               self._input_device.limit_yaw,
+                                               self._input_device.limit_thrust)
+                    self._read_timer.start()
+                    return self._input_device.supports_mapping
         except Exception:
             self.device_error.call(
                      "Error while opening/initializing  input device\n\n%s" %
                      (traceback.format_exc()))
 
-    def stop_input(self):
+        if not self._input_device:
+            self.device_error.call(
+                     "Could not find device {}".format(device_name))
+        return False
+
+    def stop_input(self, device_name = None):
         """Stop reading from the input device."""
-        self._read_timer.stop()
+        if device_name:
+            for d in readers.devices():
+                if d.name == device_name:
+                    d.close()
+        else:
+            for d in readers.devices():
+                d.close()
+            #if self._input_device:
+            #    self._input_device.close()
+            #    self._input_device = None
 
     def set_yaw_limit(self, max_yaw_rate):
         """Set a new max yaw rate value."""
-        self._max_yaw_rate = max_yaw_rate
+        for m in self._mux:
+            m.max_yaw_rate = max_yaw_rate
 
     def set_rp_limit(self, max_rp_angle):
         """Set a new max roll/pitch value."""
-        self._max_rp_angle = max_rp_angle
+        for m in self._mux:
+            m.max_rp_angle = max_rp_angle
 
     def set_thrust_slew_limiting(self, thrust_slew_rate, thrust_slew_limit):
         """Set new values for limit where the slewrate control kicks in and
         for the slewrate."""
-        self._thrust_slew_rate = JoystickReader.p2t(thrust_slew_rate)
-        self._thrust_slew_limit = JoystickReader.p2t(thrust_slew_limit)
-        if (thrust_slew_rate > 0):
-            self._thrust_slew_enabled = True
-        else:
-            self._thrust_slew_enabled = False
+        for m in self._mux:
+            m.thrust_slew_rate = JoystickReader.p2t(thrust_slew_rate)
+            m.thrust_slew_limit = JoystickReader.p2t(thrust_slew_limit)
+            if thrust_slew_rate > 0:
+                m.thrust_slew_enabled = True
+            else:
+                m.thrust_slew_enabled = False
 
     def set_thrust_limits(self, min_thrust, max_thrust):
         """Set a new min/max thrust limit."""
-        self._min_thrust = JoystickReader.p2t(min_thrust)
-        self._max_thrust = JoystickReader.p2t(max_thrust)
+        for m in self._mux:
+            m.min_thrust = JoystickReader.p2t(min_thrust)
+            m.max_thrust = JoystickReader.p2t(max_thrust)
 
     def set_trim_roll(self, trim_roll):
         """Set a new value for the roll trim."""
-        self._trim_roll = trim_roll
+        for m in self._mux:
+            m.trim_roll = trim_roll
 
     def set_trim_pitch(self, trim_pitch):
         """Set a new value for the trim trim."""
-        self._trim_pitch = trim_pitch
+        for m in self._mux:
+            m.trim_pitch = trim_pitch
+
+    def _calc_rp_trim(self, key_neg, key_pos, data):
+        if self._check_toggle(key_neg, data) and not data[key_neg]:
+            return -1.0
+        if self._check_toggle(key_pos, data) and not data[key_pos]:
+            return 1.0
+        return 0.0
+
+    def _check_toggle(self, key, data):
+        if not key in self._prev_values:
+            self._prev_values[key] = data[key]
+        elif self._prev_values[key] != data[key]:
+            self._prev_values[key] = data[key]
+            return True
+        return False
 
     def read_input(self):
         """Read input data from the selected device"""
         try:
-            data = self.inputdevice.read_input()
-            roll = data["roll"] * self._max_rp_angle
-            pitch = data["pitch"] * self._max_rp_angle
-            thrust = data["thrust"]
-            yaw = data["yaw"]
-            raw_thrust = data["thrust"]
-            emergency_stop = data["estop"]
-            trim_roll = data["rollcal"]
-            trim_pitch = data["pitchcal"]
-            althold = data["althold"]
+            [roll, pitch, yaw, thrust] = self._selected_mux.read()
 
-            if (self._old_alt_hold != althold):
-                self.althold_updated.call(str(althold))
-                self._old_alt_hold = althold
+            #if trim_roll != 0 or trim_pitch != 0:
+            #    self._trim_roll += trim_roll
+            #    self._trim_pitch += trim_pitch
+            #    self.rp_trim_updated.call(self._trim_roll, self._trim_pitch)
 
-            if self._emergency_stop != emergency_stop:
-                self._emergency_stop = emergency_stop
-                self.emergency_stop_updated.call(self._emergency_stop)
-
-            # Thust limiting (slew, minimum and emergency stop)
-            if self._springy_throttle:
-                if althold and self._has_pressure_sensor:
-                    thrust = int(round(JoystickReader.deadband(thrust,0.2)*32767 + 32767)) #Convert to uint16
-                else:
-                    if raw_thrust < 0.05 or emergency_stop:
-                        thrust = 0
-                    else:
-                        thrust = self._min_thrust + thrust * (self._max_thrust -
-                                                                self._min_thrust)
-                    if (self._thrust_slew_enabled == True and
-                        self._thrust_slew_limit > thrust and not
-                        emergency_stop):
-                        if self._old_thrust > self._thrust_slew_limit:
-                            self._old_thrust = self._thrust_slew_limit
-                        if thrust < (self._old_thrust - (self._thrust_slew_rate / 100)):
-                            thrust = self._old_thrust - self._thrust_slew_rate / 100
-                        if raw_thrust < 0 or thrust < self._min_thrust:
-                            thrust = 0
-            else:
-                thrust = data["thrust"] / 2 + 0.5
-                if althold and self._has_pressure_sensor:
-                    #thrust = int(round(JoystickReader.deadband(thrust,0.2)*32767 + 32767)) #Convert to uint16
-                    thrust = 32767
-                
-                else:
-                    if raw_thrust < -0.90 or emergency_stop:
-                        thrust = 0
-                    else:
-                        thrust = self._min_thrust + thrust * (self._max_thrust -
-                                                                self._min_thrust)
-                    if (self._thrust_slew_enabled == True and
-                        self._thrust_slew_limit > thrust and not
-                        emergency_stop):
-                        if self._old_thrust > self._thrust_slew_limit:
-                            self._old_thrust = self._thrust_slew_limit
-                        if thrust < (self._old_thrust - (self._thrust_slew_rate / 100)):
-                            thrust = self._old_thrust - self._thrust_slew_rate / 100
-                        if raw_thrust < -1 or thrust < self._min_thrust:
-                            thrust = 0
-
-            self._old_thrust = thrust
-            self._old_raw_thrust = raw_thrust
-            # Yaw deadband
-            # TODO: Add to input device config?
-            yaw = JoystickReader.deadband(yaw,0.2)*self._max_yaw_rate           
-
-            if trim_roll != 0 or trim_pitch != 0:
-                self._trim_roll += trim_roll
-                self._trim_pitch += trim_pitch
-                self.rp_trim_updated.call(self._trim_roll, self._trim_pitch)
-
-            trimmed_roll = roll + self._trim_roll
-            trimmed_pitch = pitch + self._trim_pitch
+            #trimmed_roll = roll + self._trim_roll
+            #trimmed_pitch = pitch + self._trim_pitch
 
             # Thrust might be <0 here, make sure it's not otherwise we'll get an error.
             if thrust < 0:
-              thrust = 0
+                thrust = 0
+            if thrust > 65535:
+                thrust = 65535
 
-            self.input_updated.call(trimmed_roll, trimmed_pitch, yaw, thrust)
+            self.input_updated.call(roll, pitch, yaw, thrust)
         except Exception:
             logger.warning("Exception while reading inputdevice: %s",
                            traceback.format_exc())
             self.device_error.call("Error reading from input device\n\n%s" %
                                      traceback.format_exc())
+            self.input_updated.call(0, 0, 0, 0)
             self._read_timer.stop()
 
     @staticmethod
